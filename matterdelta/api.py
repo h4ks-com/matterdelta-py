@@ -4,9 +4,10 @@ import base64
 import json
 import tempfile
 import time
+from collections import OrderedDict
 from pathlib import Path
-from threading import Thread
-from typing import Dict, List, Tuple
+from threading import Lock, Thread
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from deltachat2 import Bot, JsonRpcError, Message, MessageViewtype, MsgData
@@ -14,6 +15,38 @@ from deltachat2 import Bot, JsonRpcError, Message, MessageViewtype, MsgData
 mb_config = {}
 chat2gateway: Dict[Tuple[int, int], List[str]] = {}
 gateway2chat: Dict[str, List[Tuple[int, int]]] = {}
+
+# Maps matterbridge canonical msg id -> {(accid, chat_id): dc_msgid}.
+# Lets us set MsgData.quoted_message_id when a matterbridge reply arrives,
+# so Delta Chat renders a native quote bubble instead of plain text.
+_MB2DC_CACHE_SIZE = 2000
+_mb2dc_cache: "OrderedDict[str, Dict[Tuple[int, int], int]]" = OrderedDict()
+_mb2dc_lock = Lock()
+
+
+def _cache_put(mb_id: str, accid: int, chat_id: int, dc_msgid: int) -> None:
+    if not mb_id or not dc_msgid:
+        return
+    with _mb2dc_lock:
+        entry = _mb2dc_cache.get(mb_id)
+        if entry is None:
+            entry = {}
+            _mb2dc_cache[mb_id] = entry
+        entry[(accid, chat_id)] = dc_msgid
+        _mb2dc_cache.move_to_end(mb_id)
+        while len(_mb2dc_cache) > _MB2DC_CACHE_SIZE:
+            _mb2dc_cache.popitem(last=False)
+
+
+def _cache_get(mb_id: str, accid: int, chat_id: int) -> Optional[int]:
+    if not mb_id:
+        return None
+    with _mb2dc_lock:
+        entry = _mb2dc_cache.get(mb_id)
+        if entry is None:
+            return None
+        _mb2dc_cache.move_to_end(mb_id)
+        return entry.get((accid, chat_id))
 
 
 def init_api(bot: Bot, config_dir: str) -> None:
@@ -88,6 +121,12 @@ def mb2dc(bot: Bot, msg: dict, exclude: Tuple[int, int] = (0, 0)) -> None:  # no
     text = msg.get("text") or ""
     if msg["event"] == "user_action":
         text = "/me " + text
+    mb_id = msg.get("id") or ""
+    parent_id = msg.get("parent_id") or ""
+    # matterbridge emits this sentinel when it can't resolve the parent across the
+    # bridge cache; treat it as no parent rather than searching for it.
+    if parent_id == "msg-parent-not-found":
+        parent_id = ""
     reply = MsgData(
         text=text,
         override_sender_name=msg["username"],
@@ -104,16 +143,26 @@ def mb2dc(bot: Bot, msg: dict, exclude: Tuple[int, int] = (0, 0)) -> None:  # no
             if file["Name"].endswith((".tgs", ".webp")):
                 reply.viewtype = MessageViewtype.STICKER
             for accid, chat_id in chats:
+                reply.quoted_message_id = (
+                    _cache_get(parent_id, accid, chat_id) if parent_id else None
+                )
                 try:
-                    bot.rpc.send_msg(accid, chat_id, reply)
+                    dc_msgid = bot.rpc.send_msg(accid, chat_id, reply)
                 except JsonRpcError as ex:
                     bot.logger.exception(ex)
+                    continue
+                _cache_put(mb_id, accid, chat_id, dc_msgid)
     elif text:
         for accid, chat_id in chats:
+            reply.quoted_message_id = (
+                _cache_get(parent_id, accid, chat_id) if parent_id else None
+            )
             try:
-                bot.rpc.send_msg(accid, chat_id, reply)
+                dc_msgid = bot.rpc.send_msg(accid, chat_id, reply)
             except JsonRpcError as ex:
                 bot.logger.exception(ex)
+                continue
+            _cache_put(mb_id, accid, chat_id, dc_msgid)
 
 
 def listen_to_matterbridge(bot: Bot) -> None:
