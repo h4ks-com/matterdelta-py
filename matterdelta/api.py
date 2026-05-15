@@ -16,37 +16,56 @@ mb_config = {}
 chat2gateway: Dict[Tuple[int, int], List[str]] = {}
 gateway2chat: Dict[str, List[Tuple[int, int]]] = {}
 
-# Maps matterbridge canonical msg id -> {(accid, chat_id): dc_msgid}.
-# Lets us set MsgData.quoted_message_id when a matterbridge reply arrives,
-# so Delta Chat renders a native quote bubble instead of plain text.
-_MB2DC_CACHE_SIZE = 2000
+# Two-way mapping between matterbridge canonical msg ids and Delta Chat msg ids
+# so we can render native Delta Chat quote bubbles on inbound replies and send
+# parent_id on outbound DC->MB replies (instead of relying on text embedding).
+_CACHE_SIZE = 2000
 _mb2dc_cache: "OrderedDict[str, Dict[Tuple[int, int], int]]" = OrderedDict()
-_mb2dc_lock = Lock()
+_dc2mb_cache: "OrderedDict[Tuple[int, int, int], str]" = OrderedDict()
+_cache_lock = Lock()
 
 
 def _cache_put(mb_id: str, accid: int, chat_id: int, dc_msgid: int) -> None:
     if not mb_id or not dc_msgid:
         return
-    with _mb2dc_lock:
+    with _cache_lock:
         entry = _mb2dc_cache.get(mb_id)
         if entry is None:
             entry = {}
             _mb2dc_cache[mb_id] = entry
         entry[(accid, chat_id)] = dc_msgid
         _mb2dc_cache.move_to_end(mb_id)
-        while len(_mb2dc_cache) > _MB2DC_CACHE_SIZE:
+        while len(_mb2dc_cache) > _CACHE_SIZE:
             _mb2dc_cache.popitem(last=False)
+
+        dc_key = (accid, chat_id, dc_msgid)
+        _dc2mb_cache[dc_key] = mb_id
+        _dc2mb_cache.move_to_end(dc_key)
+        while len(_dc2mb_cache) > _CACHE_SIZE:
+            _dc2mb_cache.popitem(last=False)
 
 
 def _cache_get(mb_id: str, accid: int, chat_id: int) -> Optional[int]:
     if not mb_id:
         return None
-    with _mb2dc_lock:
+    with _cache_lock:
         entry = _mb2dc_cache.get(mb_id)
         if entry is None:
             return None
         _mb2dc_cache.move_to_end(mb_id)
         return entry.get((accid, chat_id))
+
+
+def _cache_get_mb(accid: int, chat_id: int, dc_msgid: int) -> Optional[str]:
+    if not dc_msgid:
+        return None
+    with _cache_lock:
+        key = (accid, chat_id, dc_msgid)
+        mb_id = _dc2mb_cache.get(key)
+        if mb_id is None:
+            return None
+        _dc2mb_cache.move_to_end(key)
+        return mb_id
 
 
 def init_api(bot: Bot, config_dir: str) -> None:
@@ -82,7 +101,14 @@ def dc2mb(bot: Bot, accid: int, msg: Message) -> None:
             text = text[3:].strip()
         else:
             event = ""
-        if msg.quote and mb_config.get("quoteFormat"):
+        parent_mb_id = ""
+        if msg.quote:
+            quoted_dc_msgid = (
+                msg.quote.get("message_id") or msg.quote.get("messageId") or 0
+            )
+            if quoted_dc_msgid:
+                parent_mb_id = _cache_get_mb(accid, msg.chat_id, quoted_dc_msgid) or ""
+        if msg.quote and not parent_mb_id and mb_config.get("quoteFormat"):
             quotenick = msg.quote.get("override_sender_name") or msg.quote.get(
                 "author_display_name"
             )
@@ -92,6 +118,8 @@ def dc2mb(bot: Bot, accid: int, msg: Message) -> None:
                 QUOTEMESSAGE=" ".join(msg.quote.text.split()),
             )
         data = {"username": username, "text": text, "event": event}
+        if parent_mb_id:
+            data["parent_id"] = parent_mb_id
         if msg.file:
             with open(msg.file, mode="rb") as attachment:
                 enc_data = base64.standard_b64encode(attachment.read()).decode()
@@ -121,7 +149,10 @@ def mb2dc(bot: Bot, msg: dict, exclude: Tuple[int, int] = (0, 0)) -> None:  # no
     text = msg.get("text") or ""
     if msg["event"] == "user_action":
         text = "/me " + text
-    mb_id = msg.get("id") or ""
+    # matterbridge api destination has no per-message id of its own, so it
+    # exposes the canonical "<protocol> <id>" via the source_id field. parent_id
+    # already uses that same form, so the two are directly comparable.
+    mb_id = msg.get("source_id") or msg.get("id") or ""
     parent_id = msg.get("parent_id") or ""
     # matterbridge emits this sentinel when it can't resolve the parent across the
     # bridge cache; treat it as no parent rather than searching for it.
