@@ -56,6 +56,20 @@ def _cache_get(mb_id: str, accid: int, chat_id: int) -> Optional[int]:
         return entry.get((accid, chat_id))
 
 
+def _needs_full_download(msg: Message) -> bool:
+    """True when a message has an attachment that hasn't been fetched yet."""
+    if not msg.get("file_name"):
+        return False
+    if msg.get("file"):
+        return False
+    state = msg.get("download_state")
+    if state in (None, "Done"):
+        # Some servers (chatmail) don't expose download_state for already-done
+        # messages; if there's no file but no state either, try anyway.
+        return True
+    return state in ("Available", "InProgress", "Failure")
+
+
 def _cache_get_mb(accid: int, chat_id: int, dc_msgid: int) -> Optional[str]:
     if not dc_msgid:
         return None
@@ -89,6 +103,13 @@ def dc2mb(bot: Bot, accid: int, msg: Message) -> None:
     """Send a Delta Chat message to the matterbridge side."""
     if not msg.text and not msg.file:  # ignore buggy empty messages
         return
+    # NewMessage can fire before the attachment finishes downloading
+    if _needs_full_download(msg):
+        try:
+            bot.rpc.download_full_msg(accid, msg.id)
+            msg = Message(bot.rpc.get_message(accid, msg.id))
+        except JsonRpcError as ex:
+            bot.logger.warning("download_full_msg failed for msg %s: %s", msg.id, ex)
     gateways = chat2gateway.get((accid, msg.chat_id), [])
     if gateways:
         username = (
