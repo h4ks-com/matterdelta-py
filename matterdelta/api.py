@@ -133,9 +133,25 @@ def dc2mb(bot: Bot, accid: int, msg: Message) -> None:
             data["gateway"] = gateway
             bot.logger.debug("DC->MB %s", data)
             if api_url:
-                requests.post(
-                    api_url + "/api/message", json=data, headers=headers, timeout=60
-                )
+                try:
+                    resp = requests.post(
+                        api_url + "/api/message",
+                        json=data,
+                        headers=headers,
+                        timeout=60,
+                    )
+                    posted = resp.json() if resp.ok else {}
+                except (ValueError, requests.RequestException):
+                    posted = {}
+                # matterbridge assigns an id on POST so other clients can
+                # parent_id-reference this DC-originated message; cache it
+                # under the canonical "api <id>" form that matterbridge uses
+                # for parent_id resolution.
+                posted_id = posted.get("id") or ""
+                if posted_id:
+                    _cache_put(
+                        "api " + posted_id, accid, msg.chat_id, msg.id
+                    )
             mb2dc(bot, data, (accid, msg.chat_id))
 
 
