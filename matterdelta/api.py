@@ -56,18 +56,16 @@ def _cache_get(mb_id: str, accid: int, chat_id: int) -> Optional[int]:
         return entry.get((accid, chat_id))
 
 
-def _needs_full_download(msg: Message) -> bool:
-    """True when a message has an attachment that hasn't been fetched yet."""
-    if not msg.get("file_name"):
-        return False
-    if msg.get("file"):
-        return False
-    state = msg.get("download_state")
-    if state in (None, "Done"):
-        # Some servers (chatmail) don't expose download_state for already-done
-        # messages; if there's no file but no state either, try anyway.
-        return True
-    return state in ("Available", "InProgress", "Failure")
+def _is_unloaded_attachment(msg: Message) -> bool:
+    """True when the message has an attachment whose body hasn't landed yet."""
+    return bool(msg.get("file_name") and not msg.get("file"))
+
+
+# (accid, msg_id) → marker. Populated when dc2mb defers a placeholder relay
+# and consumed by handle_msg_changed once delta-core fires MsgsChanged with
+# the attachment body filled in.
+_pending_downloads: Dict[Tuple[int, int], None] = {}
+_pending_lock = Lock()
 
 
 def _cache_get_mb(accid: int, chat_id: int, dc_msgid: int) -> Optional[str]:
@@ -99,17 +97,44 @@ def init_api(bot: Bot, config_dir: str) -> None:
         Thread(target=listen_to_matterbridge, args=(bot,), daemon=True).start()
 
 
+def handle_msg_changed(bot: Bot, accid: int, msg_id: int) -> None:
+    """Relay a previously-deferred attachment once its body has landed."""
+    if not msg_id:
+        return
+    key = (accid, msg_id)
+    with _pending_lock:
+        if key not in _pending_downloads:
+            return
+    try:
+        msg = Message(bot.rpc.get_message(accid, msg_id))
+    except JsonRpcError:
+        return
+    if _is_unloaded_attachment(msg):
+        return
+    with _pending_lock:
+        _pending_downloads.pop(key, None)
+    dc2mb(bot, accid, msg)
+
+
 def dc2mb(bot: Bot, accid: int, msg: Message) -> None:
     """Send a Delta Chat message to the matterbridge side."""
     if not msg.text and not msg.file:  # ignore buggy empty messages
         return
-    # NewMessage can fire before the attachment finishes downloading
-    if _needs_full_download(msg):
+    # NewMessage fires before the attachment body is fetched; relaying now would
+    # send the "[Image - N KiB]" placeholder. Schedule the download and defer
+    # the relay until handle_msg_changed sees the body land.
+    if _is_unloaded_attachment(msg):
+        with _pending_lock:
+            _pending_downloads[(accid, msg.id)] = None
         try:
-            bot.rpc.download_full_msg(accid, msg.id)
-            msg = Message(bot.rpc.get_message(accid, msg.id))
+            bot.rpc.download_full_message(accid, msg.id)
         except JsonRpcError as ex:
-            bot.logger.warning("download_full_msg failed for msg %s: %s", msg.id, ex)
+            bot.logger.warning(
+                "download_full_message failed for msg %s: %s", msg.id, ex
+            )
+            with _pending_lock:
+                _pending_downloads.pop((accid, msg.id), None)
+        return
     gateways = chat2gateway.get((accid, msg.chat_id), [])
     if gateways:
         username = (

@@ -16,7 +16,7 @@ from deltachat2 import (
 from rich.logging import RichHandler
 
 from ._version import __version__
-from .api import dc2mb, init_api
+from .api import dc2mb, handle_msg_changed, init_api
 
 cli = BotCli("matterdelta")
 cli.add_generic_option("-v", "--version", action="version", version=__version__)
@@ -53,6 +53,9 @@ def _log_event(bot: Bot, accid: int, event: CoreEvent) -> None:
         bot.logger.warning(event.msg)
     elif event.kind == EventType.ERROR:
         bot.logger.error(event.msg)
+    elif event.kind == EventType.MSGS_CHANGED:
+        # Body of a previously-placeholder attachment may have landed.
+        handle_msg_changed(bot, accid, event.get("msg_id") or 0)
     elif event.kind == EventType.SECUREJOIN_INVITER_PROGRESS:
         if event.progress == 1000:
             if not bot.rpc.get_contact(accid, event.contact_id).is_bot:
