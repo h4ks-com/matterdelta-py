@@ -57,7 +57,6 @@ def _log_event(bot: Bot, accid: int, event: CoreEvent) -> None:
         # Body of a previously-placeholder attachment may have landed.
         handle_msg_changed(bot, accid, event.get("msg_id") or 0)
     elif event.kind == EventType.REACTIONS_CHANGED:
-        bot.logger.info("REACT-DBG event REACTIONS_CHANGED fired: %r", event)
         on_reactions_changed(bot, accid, event)
     elif event.kind == EventType.SECUREJOIN_INVITER_PROGRESS:
         if event.progress == 1000:

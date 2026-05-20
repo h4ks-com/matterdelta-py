@@ -115,28 +115,22 @@ _reactions_lock = Lock()
 
 def on_reactions_changed(bot: Bot, accid: int, event: object) -> None:
     """Diff a Delta Chat ReactionsChanged event and forward changes to the bridge."""
-    chat_id = getattr(event, "chat_id", 0) or getattr(event, "chatId", 0)
-    dc_msgid = getattr(event, "msg_id", 0) or getattr(event, "msgId", 0)
-    bot.logger.info("REACT-DBG changed accid=%s chat_id=%s msg_id=%s", accid, chat_id, dc_msgid)
+    chat_id = getattr(event, "chat_id", 0)
+    dc_msgid = getattr(event, "msg_id", 0)
     if not dc_msgid:
-        bot.logger.info("REACT-DBG bail: no msg_id (event=%r)", event)
         return
     mb_id = _cache_get_mb(accid, chat_id, dc_msgid)
     if not mb_id:
-        bot.logger.info("REACT-DBG bail: no mb_id in cache for (accid=%s chat=%s msg=%s)", accid, chat_id, dc_msgid)
-        return
+        return  # not a bridged message
     gateways = chat2gateway.get((accid, chat_id), [])
     if not gateways:
-        bot.logger.info("REACT-DBG bail: no gateways for (accid=%s chat=%s)", accid, chat_id)
         return
 
     try:
         reactions = bot.rpc.get_message_reactions(accid, dc_msgid)
-    except JsonRpcError as ex:
-        bot.logger.info("REACT-DBG bail: get_message_reactions error %s", ex)
+    except JsonRpcError:
         return
     new_state = reactions_by_contact(reactions)
-    bot.logger.info("REACT-DBG reactions=%r new_state=%r", reactions, new_state)
 
     with _reactions_lock:
         key = (accid, dc_msgid)
@@ -150,7 +144,6 @@ def on_reactions_changed(bot: Bot, accid: int, event: object) -> None:
             _reactions_state.pop(key, None)
 
     added, removed = diff_reactions(prev, new_state)
-    bot.logger.info("REACT-DBG mb_id=%s added=%r removed=%r", mb_id, added, removed)
     for contact_id, emoji in added:
         _emit_reaction(bot, accid, contact_id, mb_id, emoji, "reaction_add", gateways)
     for contact_id, emoji in removed:
@@ -169,7 +162,6 @@ def _emit_reaction(
     gateways: List[str],
 ) -> None:
     if contact_id == _SELF_CONTACT_ID:
-        bot.logger.info("REACT-DBG skip contact=SELF(1) emoji=%s (reacting as bot account?)", emoji)
         return  # the bot's own reaction echoed back; don't loop it
     try:
         contact = bot.rpc.get_contact(accid, contact_id)
