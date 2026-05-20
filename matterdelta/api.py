@@ -12,6 +12,8 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from deltachat2 import Bot, JsonRpcError, Message, MessageViewtype, MsgData
 
+from .reactions import diff_reactions, reactions_by_contact
+
 mb_config = {}
 chat2gateway: Dict[Tuple[int, int], List[str]] = {}
 gateway2chat: Dict[str, List[Tuple[int, int]]] = {}
@@ -78,6 +80,106 @@ def _cache_get_mb(accid: int, chat_id: int, dc_msgid: int) -> Optional[str]:
             return None
         _dc2mb_cache.move_to_end(key)
         return mb_id
+
+
+def _mb_headers() -> Optional[dict]:
+    token = mb_config["api"].get("token", "")
+    return {"Authorization": f"Bearer {token}"} if token else None
+
+
+def _mb_post(bot: Bot, data: dict) -> dict:
+    """POST a message/event to the matterbridge API; return the parsed response
+    (empty dict on missing url or failure). matterbridge assigns an id we cache."""
+    api_url = mb_config["api"]["url"]
+    if not api_url:
+        return {}
+    try:
+        resp = requests.post(
+            api_url + "/api/message", json=data, headers=_mb_headers(), timeout=60
+        )
+        return resp.json() if resp.ok else {}
+    except (ValueError, requests.RequestException) as ex:
+        bot.logger.warning("matterbridge POST failed: %s", ex)
+        return {}
+
+
+# Delta Chat's SELF contact always has id 1; its reactions are the bot's own
+# (set when relaying an inbound reaction) and must not loop back to the bridge.
+_SELF_CONTACT_ID = 1
+
+# Per-message snapshot of the reaction set we last forwarded, so we can diff
+# against it when ReactionsChanged fires (the event says a set changed, not what).
+_reactions_state: "OrderedDict[Tuple[int, int], Dict[int, set]]" = OrderedDict()
+_reactions_lock = Lock()
+
+
+def on_reactions_changed(bot: Bot, accid: int, event: object) -> None:
+    """Diff a Delta Chat ReactionsChanged event and forward changes to the bridge."""
+    chat_id = getattr(event, "chat_id", 0)
+    dc_msgid = getattr(event, "msg_id", 0)
+    if not dc_msgid:
+        return
+    mb_id = _cache_get_mb(accid, chat_id, dc_msgid)
+    if not mb_id:
+        return  # not a bridged message
+    gateways = chat2gateway.get((accid, chat_id), [])
+    if not gateways:
+        return
+
+    try:
+        reactions = bot.rpc.get_message_reactions(accid, dc_msgid)
+    except JsonRpcError:
+        return
+    new_state = reactions_by_contact(reactions)
+
+    with _reactions_lock:
+        key = (accid, dc_msgid)
+        prev = _reactions_state.get(key, {})
+        if new_state:
+            _reactions_state[key] = new_state
+            _reactions_state.move_to_end(key)
+            while len(_reactions_state) > _CACHE_SIZE:
+                _reactions_state.popitem(last=False)
+        else:
+            _reactions_state.pop(key, None)
+
+    added, removed = diff_reactions(prev, new_state)
+    for contact_id, emoji in added:
+        _emit_reaction(bot, accid, contact_id, mb_id, emoji, "reaction_add", gateways)
+    for contact_id, emoji in removed:
+        _emit_reaction(
+            bot, accid, contact_id, mb_id, emoji, "reaction_remove", gateways
+        )
+
+
+def _emit_reaction(
+    bot: Bot,
+    accid: int,
+    contact_id: int,
+    mb_parent: str,
+    emoji: str,
+    event_name: str,
+    gateways: List[str],
+) -> None:
+    if contact_id == _SELF_CONTACT_ID:
+        return  # the bot's own reaction echoed back; don't loop it
+    try:
+        contact = bot.rpc.get_contact(accid, contact_id)
+        username = contact.display_name or contact.address or "unknown"
+    except JsonRpcError:
+        username = "unknown"
+    for gateway in gateways:
+        _mb_post(
+            bot,
+            {
+                "username": username,
+                "text": emoji,
+                "emoji": emoji,
+                "event": event_name,
+                "parent_id": mb_parent,
+                "gateway": gateway,
+            },
+        )
 
 
 def init_api(bot: Bot, config_dir: str) -> None:
@@ -172,37 +274,53 @@ def dc2mb(bot: Bot, accid: int, msg: Message) -> None:
             data["Extra"] = {
                 "file": [{"Name": msg.file_name, "Data": enc_data, "Comment": text}]
             }
-        api_url = mb_config["api"]["url"]
-        token = mb_config["api"].get("token", "")
-        headers = {"Authorization": f"Bearer {token}"} if token else None
         for gateway in gateways:
             data["gateway"] = gateway
             bot.logger.debug("DC->MB %s", data)
-            if api_url:
-                try:
-                    resp = requests.post(
-                        api_url + "/api/message",
-                        json=data,
-                        headers=headers,
-                        timeout=60,
-                    )
-                    posted = resp.json() if resp.ok else {}
-                except (ValueError, requests.RequestException):
-                    posted = {}
-                # matterbridge assigns an id on POST so other clients can
-                # parent_id-reference this DC-originated message; cache it
-                # under the canonical "api <id>" form that matterbridge uses
-                # for parent_id resolution.
-                posted_id = posted.get("id") or ""
-                if posted_id:
-                    _cache_put(
-                        "api " + posted_id, accid, msg.chat_id, msg.id
-                    )
+            # matterbridge assigns an id on POST so other clients can
+            # parent_id-reference this DC-originated message; cache it under the
+            # canonical "api <id>" form matterbridge uses for parent_id resolution.
+            posted_id = _mb_post(bot, data).get("id") or ""
+            if posted_id:
+                _cache_put("api " + posted_id, accid, msg.chat_id, msg.id)
             mb2dc(bot, data, (accid, msg.chat_id))
+
+
+def _mb_reaction_to_dc(bot: Bot, msg: dict, exclude: Tuple[int, int]) -> None:
+    """Apply an inbound matterbridge reaction to the bridged Delta Chat message.
+
+    Delta Chat reacts as the bot account, so the original reactor's identity is
+    lost and only one reaction per message can be held (a second cross-platform
+    reaction overrides the first).
+    """
+    chats = [c for c in gateway2chat.get(msg["gateway"], []) if c != exclude]
+    if not chats:
+        return
+    parent_id = msg.get("parent_id") or ""
+    if parent_id in ("", "msg-parent-not-found"):
+        return
+    emoji = msg.get("emoji") or msg.get("text") or ""
+    add = msg["event"] == "reaction_add"
+    if add and not emoji:
+        return
+    # Vec<String> per the send_reaction JSON-RPC signature; an empty string
+    # clears the bot's reaction.
+    reaction = [emoji] if add else [""]
+    for accid, chat_id in chats:
+        dc_msgid = _cache_get(parent_id, accid, chat_id)
+        if not dc_msgid:
+            continue
+        try:
+            bot.rpc.send_reaction(accid, dc_msgid, reaction)
+        except JsonRpcError as ex:
+            bot.logger.warning("send_reaction failed: %s", ex)
 
 
 def mb2dc(bot: Bot, msg: dict, exclude: Tuple[int, int] = (0, 0)) -> None:  # noqa: C901
     """Send a message from matterbridge to the bridged Delta Chat group"""
+    if msg["event"] in ("reaction_add", "reaction_remove"):
+        _mb_reaction_to_dc(bot, msg, exclude)
+        return
     if msg["event"] not in ("", "user_action"):
         return
     chats = [c for c in gateway2chat.get(msg["gateway"], []) if c != exclude]
@@ -262,14 +380,14 @@ def listen_to_matterbridge(bot: Bot) -> None:
     """Process forever the streams of messages from matterbridge API"""
     bot.logger.debug("Listening to matterbridge API...")
     api_url = mb_config["api"]["url"]
-    token = mb_config["api"].get("token", "")
-    headers = {"Authorization": f"Bearer {token}"} if token else None
     with requests.Session() as session:
         while True:
             try:
                 # use the /api/messages endpoint because /api/stream have issues:
                 # https://github.com/42wim/matterbridge/issues/1983
-                with session.get(api_url + "/api/messages", headers=headers) as resp:
+                with session.get(
+                    api_url + "/api/messages", headers=_mb_headers()
+                ) as resp:
                     for msg in resp.json():
                         bot.logger.debug(msg)
                         mb2dc(bot, msg)
