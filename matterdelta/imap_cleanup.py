@@ -54,11 +54,10 @@ def _imap_creds(bot: Bot, accid: int) -> Optional[Tuple[str, int, str, str]]:
         return None
     transport = transports[0]
     addr = transport.get("addr") or ""
-    imap = transport.get("imap") or {}
-    host = imap.get("server") or _derive_host(addr)
-    port = int(imap.get("port") or 0) or _DEFAULT_IMAP_PORT
-    user = imap.get("user") or addr
-    pw = imap.get("password") or bot.rpc.get_config(accid, "mail_pw") or ""
+    host = transport.get("imapServer") or _derive_host(addr)
+    port = int(transport.get("imapPort") or 0) or _DEFAULT_IMAP_PORT
+    user = transport.get("imapUser") or addr
+    pw = transport.get("password") or bot.rpc.get_config(accid, "mail_pw") or ""
     if not (host and user and pw):
         return None
     return host, port, user, pw
