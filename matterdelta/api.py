@@ -1,6 +1,7 @@
 """Matterbridge API interaction"""
 
 import base64
+import imaplib
 import json
 import tempfile
 import time
@@ -197,6 +198,7 @@ def init_api(bot: Bot, config_dir: str) -> None:
 
     if mb_config["api"]["url"] and len(gateways):
         Thread(target=listen_to_matterbridge, args=(bot,), daemon=True).start()
+    Thread(target=imap_cleanup_loop, args=(bot,), daemon=True).start()
 
 
 def handle_msg_changed(bot: Bot, accid: int, msg_id: int) -> None:
@@ -395,3 +397,36 @@ def listen_to_matterbridge(bot: Bot) -> None:
             except Exception as ex:  # pylint: disable=W0703
                 bot.logger.exception(ex)
                 time.sleep(15)
+
+
+_IMAP_CLEANUP_INTERVAL = 1800
+
+
+def imap_cleanup_loop(bot: Bot) -> None:
+    """Periodically expunge fetched messages from the bot's IMAP inbox to bound
+    server-side mailbox growth; DC keeps a local copy for delete_device_after."""
+    while True:
+        time.sleep(_IMAP_CLEANUP_INTERVAL)
+        for accid in bot.rpc.get_all_account_ids():
+            try:
+                _imap_expunge_seen(bot, accid)
+            except (imaplib.IMAP4.error, OSError, ValueError, JsonRpcError) as ex:
+                bot.logger.warning("IMAP cleanup failed for account %s: %s", accid, ex)
+
+
+def _imap_expunge_seen(bot: Bot, accid: int) -> None:
+    host = bot.rpc.get_config(accid, "configured_mail_server")
+    port_raw = bot.rpc.get_config(accid, "configured_mail_port") or "993"
+    user = bot.rpc.get_config(accid, "configured_mail_user")
+    pw = bot.rpc.get_config(accid, "configured_mail_pw")
+    if not (host and user and pw):
+        return
+    with imaplib.IMAP4_SSL(host, int(port_raw)) as imap:
+        imap.login(user, pw)
+        imap.select("INBOX")
+        typ, data = imap.uid("SEARCH", "SEEN")
+        if typ != "OK" or not data or not data[0]:
+            return
+        uids = data[0].decode("ascii").replace(" ", ",")
+        imap.uid("STORE", uids, "+FLAGS", "(\\Deleted)")
+        imap.expunge()
