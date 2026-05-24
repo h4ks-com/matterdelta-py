@@ -38,6 +38,12 @@ def _on_init(bot: Bot, args: Namespace) -> None:
             status = "I am a Delta Chat bot, send me /help for more info"
             bot.rpc.set_config(accid, "selfstatus", status)
             bot.rpc.set_config(accid, "delete_device_after", str(60 * 60 * 24 * 30))
+        # The bridge funnels every relayed message through this mailbox. Without
+        # server-side deletion the IMAP mailbox grows unbounded until it hits
+        # quota, at which point inbound mail defers (451 over quota) and DC->bridge
+        # relay silently stops. "1" deletes each message from the server right
+        # after it is fetched; local copies are kept by delete_device_after.
+        bot.rpc.set_config(accid, "delete_server_after", "1")
 
 
 @cli.on_start
