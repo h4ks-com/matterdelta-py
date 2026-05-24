@@ -400,21 +400,23 @@ def listen_to_matterbridge(bot: Bot) -> None:
 
 
 _IMAP_CLEANUP_INTERVAL = 1800
+_IMAP_CLEANUP_INITIAL_DELAY = 30
 
 
 def imap_cleanup_loop(bot: Bot) -> None:
-    """Periodically expunge fetched messages from the bot's IMAP inbox to bound
-    server-side mailbox growth; DC keeps a local copy for delete_device_after."""
+    """Periodically wipe the bot's IMAP inbox to bound server-side mailbox growth;
+    DC keeps a local copy governed by delete_device_after."""
+    time.sleep(_IMAP_CLEANUP_INITIAL_DELAY)
     while True:
-        time.sleep(_IMAP_CLEANUP_INTERVAL)
         for accid in bot.rpc.get_all_account_ids():
             try:
-                _imap_expunge_seen(bot, accid)
+                _imap_wipe_inbox(bot, accid)
             except (imaplib.IMAP4.error, OSError, ValueError, JsonRpcError) as ex:
                 bot.logger.warning("IMAP cleanup failed for account %s: %s", accid, ex)
+        time.sleep(_IMAP_CLEANUP_INTERVAL)
 
 
-def _imap_expunge_seen(bot: Bot, accid: int) -> None:
+def _imap_wipe_inbox(bot: Bot, accid: int) -> None:
     host = bot.rpc.get_config(accid, "configured_mail_server")
     port_raw = bot.rpc.get_config(accid, "configured_mail_port") or "993"
     user = bot.rpc.get_config(accid, "configured_mail_user")
@@ -424,7 +426,7 @@ def _imap_expunge_seen(bot: Bot, accid: int) -> None:
     with imaplib.IMAP4_SSL(host, int(port_raw)) as imap:
         imap.login(user, pw)
         imap.select("INBOX")
-        typ, data = imap.uid("SEARCH", "SEEN")
+        typ, data = imap.uid("SEARCH", "ALL")
         if typ != "OK" or not data or not data[0]:
             return
         uids = data[0].decode("ascii").replace(" ", ",")
