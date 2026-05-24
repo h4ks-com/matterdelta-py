@@ -1,7 +1,6 @@
 """Matterbridge API interaction"""
 
 import base64
-import imaplib
 import json
 import tempfile
 import time
@@ -13,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from deltachat2 import Bot, JsonRpcError, Message, MessageViewtype, MsgData
 
+from . import imap_cleanup
 from .reactions import diff_reactions, reactions_by_contact
 
 mb_config = {}
@@ -198,7 +198,7 @@ def init_api(bot: Bot, config_dir: str) -> None:
 
     if mb_config["api"]["url"] and len(gateways):
         Thread(target=listen_to_matterbridge, args=(bot,), daemon=True).start()
-    Thread(target=imap_cleanup_loop, args=(bot,), daemon=True).start()
+    imap_cleanup.start(bot)
 
 
 def handle_msg_changed(bot: Bot, accid: int, msg_id: int) -> None:
@@ -399,36 +399,3 @@ def listen_to_matterbridge(bot: Bot) -> None:
                 time.sleep(15)
 
 
-_IMAP_CLEANUP_INTERVAL = 1800
-_IMAP_CLEANUP_INITIAL_DELAY = 30
-
-
-def imap_cleanup_loop(bot: Bot) -> None:
-    """Periodically wipe the bot's IMAP inbox to bound server-side mailbox growth;
-    DC keeps a local copy governed by delete_device_after."""
-    time.sleep(_IMAP_CLEANUP_INITIAL_DELAY)
-    while True:
-        for accid in bot.rpc.get_all_account_ids():
-            try:
-                _imap_wipe_inbox(bot, accid)
-            except (imaplib.IMAP4.error, OSError, ValueError, JsonRpcError) as ex:
-                bot.logger.warning("IMAP cleanup failed for account %s: %s", accid, ex)
-        time.sleep(_IMAP_CLEANUP_INTERVAL)
-
-
-def _imap_wipe_inbox(bot: Bot, accid: int) -> None:
-    host = bot.rpc.get_config(accid, "configured_mail_server")
-    port_raw = bot.rpc.get_config(accid, "configured_mail_port") or "993"
-    user = bot.rpc.get_config(accid, "configured_mail_user")
-    pw = bot.rpc.get_config(accid, "configured_mail_pw")
-    if not (host and user and pw):
-        return
-    with imaplib.IMAP4_SSL(host, int(port_raw)) as imap:
-        imap.login(user, pw)
-        imap.select("INBOX")
-        typ, data = imap.uid("SEARCH", "ALL")
-        if typ != "OK" or not data or not data[0]:
-            return
-        uids = data[0].decode("ascii").replace(" ", ",")
-        imap.uid("STORE", uids, "+FLAGS", "(\\Deleted)")
-        imap.expunge()
